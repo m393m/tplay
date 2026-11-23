@@ -1,0 +1,552 @@
+#!/usr/bin/python3
+import os
+import sys
+import re
+import tty
+import time
+import fcntl
+import ctypes
+import signal
+import select
+import shutil
+import struct
+import termios
+import subprocess
+
+LIB_PATH = "/usr/lib64/libtplay_turbo.so" if os.path.exists("/usr/lib64/libtplay_turbo.so") else os.path.expanduser("~/tplay-turbo/libtplay_turbo.so")
+lib = ctypes.CDLL(LIB_PATH)
+lib.render_diff_frame.argtypes = [
+    ctypes.POINTER(ctypes.c_uint8),
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.POINTER(ctypes.c_uint8),
+]
+lib.render_diff_frame.restype = ctypes.c_int
+
+DISPLAY_NUM = ":98"
+VIRT_W, VIRT_H = 1280, 720
+force_redraw = True
+resized = False
+
+def on_sigwinch(signum, frame):
+    global resized, force_redraw
+    resized = True
+    force_redraw = True
+
+signal.signal(signal.SIGWINCH, on_sigwinch)
+
+def get_term_size(fd):
+    try:
+        packed = fcntl.ioctl(fd, termios.TIOCGWINSZ, b'\x00' * 8)
+        rows, cols, _, _ = struct.unpack('HHHH', packed)
+        if cols > 0 and rows > 0:
+            return cols, rows
+    except Exception:
+        pass
+    cols, rows = shutil.get_terminal_size((80, 24))
+    return max(10, cols), max(5, rows)
+
+def choose_target_fps(cols, rows):
+    env_fps = os.environ.get("TPLAY_FPS")
+    if env_fps and env_fps.isdigit():
+        return int(env_fps)
+    cells = cols * rows
+    if cells > 80000:
+        return 18
+    elif cells > 30000:
+        return 24
+    return 30
+
+def start_ffmpeg(cols, rows, fps):
+    w_px = cols
+    h_px = rows * 2
+    vaapi_dev = "/dev/dri/renderD128"
+    if os.path.exists(vaapi_dev):
+        cmd = [
+            "ffmpeg", "-loglevel", "quiet",
+            "-vaapi_device", vaapi_dev,
+            "-f", "x11grab", "-framerate", str(fps),
+            "-video_size", f"{VIRT_W}x{VIRT_H}", "-i", DISPLAY_NUM,
+            "-vf", f"format=nv12,hwupload,scale_vaapi=w={w_px}:h={h_px}:format=nv12,hwdownload,format=nv12,format=rgb24",
+            "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"
+        ]
+    else:
+        cmd = [
+            "ffmpeg", "-loglevel", "quiet",
+            "-f", "x11grab", "-framerate", str(fps),
+            "-video_size", f"{VIRT_W}x{VIRT_H}", "-i", DISPLAY_NUM,
+            "-vf", f"scale={w_px}:{h_px}:flags=fast_bilinear",
+            "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"
+        ]
+    return subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=w_px * h_px * 3 * 2)
+
+def stop_ffmpeg(proc):
+    if proc is None:
+        return
+    try:
+        proc.kill()
+        proc.stdout.close()
+        proc.wait(timeout=0.5)
+    except Exception:
+        pass
+
+
+class TerminalFontManager:
+    def __init__(self):
+        self.saved_ptyxis_use_sys = None
+        self.saved_ptyxis_font = None
+
+    def _run_quiet(self, cmd):
+        try:
+            return subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode("utf-8", errors="ignore").strip()
+        except Exception:
+            return None
+
+    def save_and_ensure_normal(self):
+        if shutil.which("gsettings"):
+            use_sys = self._run_quiet(["gsettings", "get", "org.gnome.Ptyxis", "use-system-font"])
+            font_name = self._run_quiet(["gsettings", "get", "org.gnome.Ptyxis", "font-name"])
+            if use_sys is not None:
+                if font_name and "TPlayPixel" in font_name:
+                    self.saved_ptyxis_use_sys = "true"
+                    self.saved_ptyxis_font = "'Monospace 11'"
+                else:
+                    self.saved_ptyxis_use_sys = use_sys
+                    self.saved_ptyxis_font = font_name or "'Monospace 11'"
+                subprocess.run(["gsettings", "set", "org.gnome.Ptyxis", "use-system-font", "true"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        if os.environ.get("KITTY_WINDOW_ID") and shutil.which("kitty"):
+            subprocess.run(["kitty", "@", "set-font-size", "0"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        sys.stdout.write("\x1b]50;monospace:size=11\x07")
+        sys.stdout.flush()
+
+    def set_pixel_mode(self):
+        if shutil.which("gsettings"):
+            subprocess.run(["gsettings", "set", "org.gnome.Ptyxis", "use-system-font", "false"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["gsettings", "set", "org.gnome.Ptyxis", "font-name", "TPlayPixel 4"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        if os.environ.get("KITTY_WINDOW_ID") and shutil.which("kitty"):
+            subprocess.run(["kitty", "@", "set-font-size", "4"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        sys.stdout.write("\x1b]50;TPlayPixel:size=4\x07")
+        sys.stdout.flush()
+        time.sleep(0.25)
+
+    def restore_and_reset(self, stdout_fd):
+        if shutil.which("gsettings"):
+            use_sys = self.saved_ptyxis_use_sys if self.saved_ptyxis_use_sys in ("true", "false") else "true"
+            font_val = self.saved_ptyxis_font.strip("'") if self.saved_ptyxis_font else "Monospace 11"
+            if "TPlayPixel" in font_val:
+                font_val = "Monospace 11"
+                use_sys = "true"
+            subprocess.run(["gsettings", "set", "org.gnome.Ptyxis", "font-name", font_val],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["gsettings", "set", "org.gnome.Ptyxis", "use-system-font", use_sys],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        if os.environ.get("KITTY_WINDOW_ID") and shutil.which("kitty"):
+            subprocess.run(["kitty", "@", "set-font-size", "0"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        sys.stdout.write("\x1b]50;monospace:size=11\x07")
+        sys.stdout.flush()
+        time.sleep(0.15)
+
+        os.write(stdout_fd, b"\x1b[?1003l\x1b[?1006l\x1b[?25h\x1b[0m\x1b[?1049l\x1bc")
+        subprocess.run(["clear"], stderr=subprocess.DEVNULL)
+
+font_mgr = TerminalFontManager()
+
+def find_browser_bin():
+    for b in ("chromium", "chromium-browser", "google-chrome", "brave-browser", "microsoft-edge", "firefox"):
+        if shutil.which(b):
+            return b
+    return None
+
+def select_app_tui():
+    import glob
+    import shlex
+    import curses
+
+    apps = []
+    seen = set()
+    search_dirs = [
+        "/usr/share/applications/*.desktop",
+        os.path.expanduser("~/.local/share/applications/*.desktop"),
+        "/var/lib/flatpak/exports/share/applications/*.desktop",
+        os.path.expanduser("~/.local/share/flatpak/exports/share/applications/*.desktop"),
+        "/var/lib/snapd/desktop/applications/*.desktop",
+    ]
+    for pattern in search_dirs:
+        for desktop_file in sorted(glob.glob(pattern)):
+            name = None
+            exec_cmd = None
+            no_display = False
+            terminal = False
+            try:
+                with open(desktop_file, "r", encoding="utf-8", errors="ignore") as df:
+                    in_entry = False
+                    for line in df:
+                        line = line.strip()
+                        if line.startswith("["):
+                            in_entry = (line == "[Desktop Entry]")
+                            continue
+                        if not in_entry or "=" not in line:
+                            continue
+                        k, v = line.split("=", 1)
+                        if k == "Name" and not name:
+                            name = v
+                        elif k == "Exec" and not exec_cmd:
+                            parts = [p for p in v.split() if not p.startswith("%")]
+                            exec_cmd = " ".join(parts)
+                        elif k == "NoDisplay" and v.lower() == "true":
+                            no_display = True
+                        elif k == "Terminal" and v.lower() == "true":
+                            terminal = True
+            except Exception:
+                continue
+
+            if name and exec_cmd and not no_display and not terminal and name not in seen:
+                seen.add(name)
+                tag = "[Flatpak]" if "flatpak" in desktop_file else ("[Snap]" if "snapd" in desktop_file else "")
+                display_name = f"{name} {tag}".strip()
+                apps.append((display_name, exec_cmd))
+
+    # Поиск AppImage в стандартных папках пользователя
+    appimage_dirs = [
+        os.path.expanduser("~/Applications"),
+        os.path.expanduser("~/Downloads"),
+        os.path.expanduser("~/Загрузки"),
+        os.path.expanduser("~/Desktop"),
+        os.path.expanduser("~/Рабочий стол"),
+        os.path.expanduser("~"),
+    ]
+    for d in appimage_dirs:
+        if not os.path.isdir(d):
+            continue
+        for fpath in sorted(glob.glob(os.path.join(d, "*.AppImage"))):
+            fname = os.path.basename(fpath)
+            if fname not in seen:
+                seen.add(fname)
+                apps.append((f"{fname} [AppImage]", f"env APPIMAGE_EXTRACT_AND_RUN=1 {shlex.quote(fpath)}"))
+
+    apps.sort(key=lambda x: next(iter(x)).lower())
+    apps.insert(0, ("[ 🌐 Открыть веб-приложение (URL)... ]", "__WEBAPP__"))
+    apps.insert(1, ("[ ⌨️ Ввести команду вручную... ]", "__CUSTOM__"))
+
+    def menu(stdscr):
+        curses.curs_set(0)
+        curses.use_default_colors()
+        idx = 0
+        query = ""
+
+        while True:
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+            q = query.lower()
+            filtered = [a for a in apps if any(q in field.lower() for field in a)]
+            if not filtered:
+                filtered = [("[ ⌨️ Ввести команду вручную... ]", "__CUSTOM__")]
+            idx = max(0, min(idx, len(filtered) - 1))
+
+            header = " TPlay Turbo — Приложения / Flatpak / Snap / AppImage / Web (Enter / Esc) "
+            stdscr.addnstr(0, 0, header.ljust(w), w - 1, curses.A_REVERSE)
+            search_line = f" Поиск: {query}_"
+            stdscr.addnstr(1, 0, search_line, w - 1, curses.A_BOLD)
+
+            visible_rows = max(1, h - 3)
+            start = max(0, idx - visible_rows // 2)
+            for row_i, item in enumerate(filtered[start:start + visible_rows]):
+                y = row_i + 2
+                app_name, app_exec = item
+                label = f" {app_name}  ({app_exec})" if not app_exec.startswith("__") else f" {app_name}"
+                attr = curses.A_REVERSE if (start + row_i) == idx else curses.A_NORMAL
+                stdscr.addnstr(y, 0, label.ljust(w), w - 1, attr)
+
+            stdscr.refresh()
+            ch = stdscr.get_wch()
+
+            if ch == curses.KEY_UP:
+                idx = (idx - 1) % len(filtered)
+            elif ch == curses.KEY_DOWN:
+                idx = (idx + 1) % len(filtered)
+            elif ch in (chr(10), chr(13), curses.KEY_ENTER):
+                app_name, app_exec = filtered[idx]
+                if app_exec == "__CUSTOM__":
+                    curses.echo()
+                    curses.curs_set(1)
+                    stdscr.addnstr(h - 1, 0, " Команда: ".ljust(w), w - 1, curses.A_REVERSE)
+                    cmd_bytes = stdscr.getstr(h - 1, 10, 200)
+                    raw_str = cmd_bytes.decode("utf-8", errors="ignore").strip()
+                    return shlex.split(raw_str) if raw_str else None
+                elif app_exec == "__WEBAPP__":
+                    browser = find_browser_bin()
+                    if not browser:
+                        return None
+                    curses.echo()
+                    curses.curs_set(1)
+                    stdscr.addnstr(h - 1, 0, " URL сайта (напр. youtube.com): ".ljust(w), w - 1, curses.A_REVERSE)
+                    url_bytes = stdscr.getstr(h - 1, 32, 200)
+                    url = url_bytes.decode("utf-8", errors="ignore").strip()
+                    if not url:
+                        return None
+                    if not url.startswith(("http://", "https://")):
+                        url = "https://" + url
+                    if "firefox" in browser:
+                        return [browser, "--kiosk", url]
+                    return [
+                        browser,
+                        f"--app={url}",
+                        "--no-first-run",
+                        "--disable-dev-shm-usage",
+                        "--use-gl=angle",
+                        "--use-angle=gl-egl",
+                        f"--window-size={VIRT_W},{VIRT_H}",
+                        "--window-position=0,0"
+                    ]
+                return shlex.split(app_exec)
+            elif ch == chr(27):
+                return None
+            elif ch in (curses.KEY_BACKSPACE, chr(127), chr(8)):
+                query = query[:-1]
+                idx = 0
+            elif isinstance(ch, str) and ch.isprintable():
+                query += ch
+                idx = 0
+
+    return curses.wrapper(menu)
+
+def maximize_xvfb_windows(env):
+    try:
+        out = subprocess.check_output(
+            ["xdotool", "search", "--onlyvisible", "--name", "."],
+            env=env, stderr=subprocess.DEVNULL
+        ).decode().splitlines()
+        for wid in out:
+            wid = wid.strip()
+            if wid:
+                subprocess.run(
+                    ["xdotool", "windowmove", wid, "0", "0", "windowsize", wid, str(VIRT_W), str(VIRT_H)],
+                    env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+    except Exception:
+        pass
+
+def main():
+    global force_redraw, resized
+
+    font_mgr.save_and_ensure_normal()
+    if len(sys.argv) < 2:
+        app_cmd = select_app_tui()
+        if not app_cmd:
+            sys.exit(0)
+    else:
+        app_cmd = sys.argv[1:]
+    font_mgr.set_pixel_mode()
+    procs = []
+
+    xvfb = subprocess.Popen(
+        ["Xvfb", DISPLAY_NUM, "-screen", "0", f"{VIRT_W}x{VIRT_H}x24", "-ac", "+extension", "GLX"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    procs.append(xvfb)
+    time.sleep(0.3)
+
+    app_env = os.environ.copy()
+    app_env["DISPLAY"] = DISPLAY_NUM
+    app_env["WAYLAND_DISPLAY"] = ""
+    app_env["DRI_PRIME"] = "1"
+    app_env["MESA_LOADER_DRIVER_OVERRIDE"] = "radeonsi"
+
+    cmd_joined = " ".join(app_cmd)
+    is_flatpak = "flatpak" in cmd_joined
+    is_snap = "snap" in cmd_joined
+    is_browser = any(b in cmd_joined for b in ("chromium", "chrome", "brave", "firefox", "edge"))
+
+    # Для Freedoom / PrBoom передаём точное разрешение виртуального экрана Xvfb
+    if any("prboom" in part for part in app_cmd) and "-geom" not in app_cmd:
+        app_cmd = app_cmd + ["-geom", f"{VIRT_W}x{VIRT_H}w"]
+
+    if is_flatpak and "run" in app_cmd:
+        run_idx = app_cmd.index("run")
+        app_cmd = app_cmd[:run_idx + 1] + ["--socket=x11", "--device=dri", "--env=DISPLAY=" + DISPLAY_NUM] + app_cmd[run_idx + 1:]
+
+    # Изолируем профиль браузеров и PWA, чтобы они не улетали в основной браузер на десктопе
+    if is_browser:
+        app_env["GDK_BACKEND"] = "x11"
+        app_env["OZONE_PLATFORM"] = "x11"
+        if "firefox" in cmd_joined.lower():
+            os.makedirs("/tmp/tplay-firefox-profile", exist_ok=True)
+            if "--no-remote" not in app_cmd:
+                app_cmd = app_cmd + ["--no-remote", "--profile", "/tmp/tplay-firefox-profile"]
+        else:
+            os.makedirs("/tmp/tplay-chromium-profile", exist_ok=True)
+            extra_flags = [
+                "--user-data-dir=/tmp/tplay-chromium-profile",
+                "--ozone-platform=x11",
+                "--no-first-run",
+                "--disable-dev-shm-usage",
+                f"--window-size={VIRT_W},{VIRT_H}",
+                "--window-position=0,0"
+            ]
+            app_cmd = app_cmd + [f for f in extra_flags if f.split("=")[0] not in cmd_joined]
+
+    if "sober" in cmd_joined.lower() and shutil.which("gamescope"):
+        launch_cmd = ["gamescope", "-W", str(VIRT_W), "-H", str(VIRT_H), "--"] + app_cmd
+    elif is_flatpak or is_snap or is_browser or not shutil.which("vglrun"):
+        launch_cmd = app_cmd
+    else:
+        launch_cmd = ["vglrun", "-d", "egl"] + app_cmd
+
+    app_proc = subprocess.Popen(launch_cmd, env=app_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    procs.append(app_proc)
+
+    xdo = subprocess.Popen(["xdotool", "-"], stdin=subprocess.PIPE, env=app_env.copy(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    procs.append(xdo)
+
+    stdin_fd = sys.stdin.fileno()
+    stdout_fd = sys.stdout.fileno()
+    old_tty = termios.tcgetattr(stdin_fd)
+
+    sgr_re = re.compile(rb'\x1b\[<(\d+);(\d+);(\d+)([Mm])')
+    special_keys = {
+        b'\x1b[A': 'Up', b'\x1b[B': 'Down', b'\x1b[C': 'Right', b'\x1b[D': 'Left',
+        b'\x1b[H': 'Home', b'\x1b[F': 'End', b'\x1b[5~': 'Prior', b'\x1b[6~': 'Next',
+        b'\x1b[3~': 'Delete', b'\x1b[2~': 'Insert', b'\x7f': 'BackSpace',
+        b'\r': 'Return', b'\n': 'Return', b'\t': 'Tab', b'\x1b': 'Escape',
+        b'\x1bOP': 'F1', b'\x1bOQ': 'F2', b'\x1bOR': 'F3', b'\x1bOS': 'F4',
+        b'\x1b[15~': 'F5', b'\x1b[17~': 'F6', b'\x1b[18~': 'F7', b'\x1b[19~': 'F8',
+        b'\x1b[20~': 'F9', b'\x1b[21~': 'F10', b'\x1b[23~': 'F11', b'\x1b[24~': 'F12',
+    }
+
+    cols, rows = get_term_size(stdout_fd)
+    fps = choose_target_fps(cols, rows)
+    ffmpeg = start_ffmpeg(cols, rows, fps)
+    frame_bytes = cols * (rows * 2) * 3
+    out_buf = (ctypes.c_uint8 * (cols * rows * 48 + 4096))()
+    frame_counter = 0
+    last_fit_time = 0.0
+
+    try:
+        tty.setraw(stdin_fd)
+        os.write(stdout_fd, b"\x1b[?1049h\x1b[?25l\x1b[?1003h\x1b[?1006h\x1b[2J\x1b[H")
+
+        while app_proc.poll() is None:
+            if resized:
+                # Даём терминалу 40 мс устаканить новый размер сетки при зуме шрифта
+                time.sleep(0.04)
+                resized = False
+                new_cols, new_rows = get_term_size(stdout_fd)
+                if (new_cols, new_rows) != (cols, rows):
+                    stop_ffmpeg(ffmpeg)
+                    cols, rows = new_cols, new_rows
+                    fps = choose_target_fps(cols, rows)
+                    frame_bytes = cols * (rows * 2) * 3
+                    out_buf = (ctypes.c_uint8 * (cols * rows * 48 + 4096))()
+                    ffmpeg = start_ffmpeg(cols, rows, fps)
+                os.write(stdout_fd, b"\x1b[2J\x1b[H")
+                force_redraw = True
+                continue
+
+            rlist, _, _ = select.select([stdin_fd, ffmpeg.stdout], [], [], 0.05)
+
+            if stdin_fd in rlist:
+                data = os.read(stdin_fd, 4096)
+                if not data or b'\x1c' in data:
+                    break
+                if b'\x0c' in data:
+                    maximize_xvfb_windows(app_env)
+                    os.write(stdout_fd, b"\x1b[2J\x1b[H")
+                    force_redraw = True
+                    data = data.replace(b'\x0c', b'')
+
+                for m in sgr_re.finditer(data):
+                    btn = int(m.group(1))
+                    cx = max(1, min(cols, int(m.group(2))))
+                    cy = max(1, min(rows, int(m.group(3))))
+                    state = m.group(4)
+
+                    px = int((cx - 0.5) * VIRT_W / cols)
+                    py = int((cy - 0.5) * VIRT_H / rows)
+
+                    is_move = (btn & 32) != 0
+                    base_btn = btn & 3
+                    cmds = [f"mousemove {px} {py}"]
+
+                    if btn == 64:
+                        cmds.append("click 4")
+                    elif btn == 65:
+                        cmds.append("click 5")
+                    elif not is_move and base_btn in (0, 1, 2):
+                        x_btn = base_btn + 1
+                        action = "mousedown" if state == b'M' else "mouseup"
+                        cmds.append(f"{action} {x_btn}")
+
+                    xdo.stdin.write(("\n".join(cmds) + "\n").encode())
+                    xdo.stdin.flush()
+
+                key_data = sgr_re.sub(b'', data)
+                if key_data:
+                    if key_data in special_keys:
+                        xdo.stdin.write(f"key --clearmodifiers {special_keys[key_data]}\n".encode())
+                        xdo.stdin.flush()
+                    elif len(key_data) == 1 and 1 <= next(iter(key_data)) <= 26:
+                        ch = chr(next(iter(key_data)) + 96)
+                        xdo.stdin.write(f"key --clearmodifiers ctrl+{ch}\n".encode())
+                        xdo.stdin.flush()
+                    elif len(key_data) == 2 and key_data[0] == 27 and chr(key_data[1]).isalnum():
+                        ch = chr(key_data[1]).lower()
+                        xdo.stdin.write(f"key --clearmodifiers alt+{ch}\n".encode())
+                        xdo.stdin.flush()
+                    else:
+                        txt = key_data.decode('utf-8', errors='ignore')
+                        cmds = []
+                        for ch in txt:
+                            if 'a' <= ch <= 'z':
+                                cmds.append(f"key --clearmodifiers {ch}")
+                            elif 'A' <= ch <= 'Z':
+                                cmds.append(f"key --clearmodifiers shift+{ch.lower()}")
+                            elif '0' <= ch <= '9':
+                                cmds.append(f"key --clearmodifiers {ch}")
+                            elif ch.isprintable():
+                                safe_ch = '\\"' if ch == '"' else ('\\\\' if ch == '\\' else ch)
+                                cmds.append(f'type --clearmodifiers --delay 0 "{safe_ch}"')
+                        if cmds:
+                            xdo.stdin.write(("\n".join(cmds) + "\n").encode())
+                            xdo.stdin.flush()
+
+            if ffmpeg.stdout in rlist and not resized:
+                raw = ffmpeg.stdout.read(frame_bytes)
+                if len(raw) != frame_bytes:
+                    continue
+
+                frame_counter += 1
+                if frame_counter in (5, 15, 30, 60):
+                    maximize_xvfb_windows(app_env)
+                is_full = 1 if (force_redraw or frame_counter % 90 == 0) else 0
+                force_redraw = False
+
+                c_frame = (ctypes.c_uint8 * frame_bytes).from_buffer_copy(raw)
+                written = lib.render_diff_frame(c_frame, cols, rows, is_full, out_buf)
+                if written > 0:
+                    os.write(stdout_fd, memoryview(out_buf)[:written])
+
+    finally:
+        termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_tty)
+        font_mgr.restore_and_reset(stdout_fd)
+        stop_ffmpeg(ffmpeg)
+        for p in procs:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+
+if __name__ == "__main__":
+    main()
