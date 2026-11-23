@@ -9,8 +9,11 @@ import ctypes
 import signal
 import select
 import shutil
+import tempfile
 import struct
 import termios
+import base64
+import threading
 import subprocess
 
 LIB_PATH = "/usr/lib64/libtplay_turbo.so" if os.path.exists("/usr/lib64/libtplay_turbo.so") else os.path.expanduser("~/tplay-turbo/libtplay_turbo.so")
@@ -25,7 +28,12 @@ lib.render_diff_frame.argtypes = [
 lib.render_diff_frame.restype = ctypes.c_int
 
 DISPLAY_NUM = ":98"
-VIRT_W, VIRT_H = 1280, 720
+BASE_W, BASE_H = 1280, 720
+MAX_FB_W, MAX_FB_H = 3840, 2160
+VIRT_W, VIRT_H = BASE_W, BASE_H
+dynamic_xrandr = False
+osd_text = ""
+osd_until = 0.0
 force_redraw = True
 resized = False
 
@@ -57,6 +65,34 @@ def choose_target_fps(cols, rows):
     elif cells > 30000:
         return 24
     return 30
+
+def compute_dynamic_resolution(cols, rows):
+    w_px = max(320, cols)
+    h_px = max(200, rows * 2)
+    aspect = w_px / float(h_px)
+    target_w = max(w_px, 1280) if aspect >= 1.0 else max(w_px, int(900 * aspect))
+    target_h = int(round(target_w / aspect))
+    if target_w > MAX_FB_W:
+        target_w = MAX_FB_W
+        target_h = int(round(target_w / aspect))
+    if target_h > MAX_FB_H:
+        target_h = MAX_FB_H
+        target_w = int(round(target_h * aspect))
+    target_w = max(320, min(MAX_FB_W, target_w - (target_w % 2)))
+    target_h = max(200, min(MAX_FB_H, target_h - (target_h % 2)))
+    return target_w, target_h
+
+def apply_xvfb_resolution(env, new_w, new_h):
+    global VIRT_W, VIRT_H
+    new_w = max(320, min(MAX_FB_W, new_w - (new_w % 2)))
+    new_h = max(200, min(MAX_FB_H, new_h - (new_h % 2)))
+    if shutil.which("xrandr"):
+        subprocess.run(
+            ["xrandr", "--fb", f"{new_w}x{new_h}"],
+            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+    VIRT_W, VIRT_H = new_w, new_h
+    maximize_xvfb_windows(env)
 
 def start_ffmpeg(cols, rows, fps):
     w_px = cols
@@ -165,7 +201,18 @@ class TerminalFontManager:
 font_mgr = TerminalFontManager()
 
 def find_browser_bin():
-    for b in ("chromium", "chromium-browser", "google-chrome", "brave-browser", "microsoft-edge", "firefox"):
+    for b in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "brave-browser", "brave", "microsoft-edge", "firefox"):
+        if shutil.which(b):
+            return [b]
+    if shutil.which("flatpak"):
+        for app_id in ("com.brave.Browser", "org.chromium.Chromium", "com.google.Chrome", "org.mozilla.firefox", "com.microsoft.Edge"):
+            res = subprocess.run(["flatpak", "info", app_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if res.returncode == 0:
+                return ["flatpak", "run", app_id]
+    return None
+
+def find_rdp_bin():
+    for b in ("xfreerdp3", "xfreerdp", "wlfreerdp", "rdesktop"):
         if shutil.which(b):
             return b
     return None
@@ -239,7 +286,8 @@ def select_app_tui():
 
     apps.sort(key=lambda x: next(iter(x)).lower())
     apps.insert(0, ("[ 🌐 Открыть веб-приложение (URL)... ]", "__WEBAPP__"))
-    apps.insert(1, ("[ ⌨️ Ввести команду вручную... ]", "__CUSTOM__"))
+    apps.insert(1, ("[ 🖥️ Подключиться к RDP-серверу... ]", "__RDP__"))
+    apps.insert(2, ("[ ⌨️ Ввести команду вручную... ]", "__CUSTOM__"))
 
     def menu(stdscr):
         curses.curs_set(0)
@@ -271,7 +319,10 @@ def select_app_tui():
                 stdscr.addnstr(y, 0, label.ljust(w), w - 1, attr)
 
             stdscr.refresh()
-            ch = stdscr.get_wch()
+            try:
+                ch = stdscr.get_wch()
+            except curses.error:
+                continue
 
             if ch == curses.KEY_UP:
                 idx = (idx - 1) % len(filtered)
@@ -279,7 +330,40 @@ def select_app_tui():
                 idx = (idx + 1) % len(filtered)
             elif ch in (chr(10), chr(13), curses.KEY_ENTER):
                 app_name, app_exec = filtered[idx]
-                if app_exec == "__CUSTOM__":
+                if app_exec == "__RDP__":
+                    rdp_bin = find_rdp_bin()
+                    if not rdp_bin:
+                        stdscr.addnstr(h - 1, 0, " Не найден xfreerdp / rdesktop! Установите freerdp. ".ljust(w), w - 1, curses.A_REVERSE)
+                        stdscr.refresh()
+                        time.sleep(2.0)
+                        return None
+                    curses.echo()
+                    curses.curs_set(1)
+                    stdscr.addnstr(h - 1, 0, " RDP адрес (IP или IP:порт): ".ljust(w), w - 1, curses.A_REVERSE)
+                    host = stdscr.getstr(h - 1, 29, 120).decode("utf-8", errors="ignore").strip()
+                    if not host:
+                        return None
+                    stdscr.addnstr(h - 1, 0, " Логин (Enter - пропустить): ".ljust(w), w - 1, curses.A_REVERSE)
+                    user = stdscr.getstr(h - 1, 29, 100).decode("utf-8", errors="ignore").strip()
+                    curses.noecho()
+                    stdscr.addnstr(h - 1, 0, " Пароль (ввод скрыт, Enter - пропустить): ".ljust(w), w - 1, curses.A_REVERSE)
+                    pwd = stdscr.getstr(h - 1, 43, 100).decode("utf-8", errors="ignore").strip()
+                    if "freerdp" in rdp_bin:
+                        cmd = [rdp_bin, f"/v:{host}", f"/w:{VIRT_W}", f"/h:{VIRT_H}", "/dynamic-resolution", "/cert:ignore", "+clipboard"]
+                        if user:
+                            cmd.append(f"/u:{user}")
+                        if pwd:
+                            cmd.append(f"/p:{pwd}")
+                        return cmd
+                    else:
+                        cmd = [rdp_bin, "-g", f"{VIRT_W}x{VIRT_H}"]
+                        if user:
+                            cmd += ["-u", user]
+                        if pwd:
+                            cmd += ["-p", pwd]
+                        cmd.append(host)
+                        return cmd
+                elif app_exec == "__CUSTOM__":
                     curses.echo()
                     curses.curs_set(1)
                     stdscr.addnstr(h - 1, 0, " Команда: ".ljust(w), w - 1, curses.A_REVERSE)
@@ -299,10 +383,10 @@ def select_app_tui():
                         return None
                     if not url.startswith(("http://", "https://")):
                         url = "https://" + url
-                    if "firefox" in browser:
-                        return [browser, "--kiosk", url]
-                    return [
-                        browser,
+                    browser_str = " ".join(browser).lower()
+                    if "firefox" in browser_str:
+                        return browser + ["--kiosk", url]
+                    return browser + [
                         f"--app={url}",
                         "--no-first-run",
                         "--disable-dev-shm-usage",
@@ -339,8 +423,32 @@ def maximize_xvfb_windows(env):
     except Exception:
         pass
 
+def osc52_clipboard_worker(env, stdout_fd, stop_event):
+    last_clip = ""
+    has_xclip = shutil.which("xclip") is not None
+    has_xsel = shutil.which("xsel") is not None
+    if not has_xclip and not has_xsel:
+        return
+    while not stop_event.is_set():
+        try:
+            cmd = ["xclip", "-o", "-selection", "clipboard"] if has_xclip else ["xsel", "-ob"]
+            out = subprocess.check_output(cmd, env=env, stderr=subprocess.DEVNULL, timeout=0.5)
+            txt = out.decode("utf-8", errors="ignore")
+            if txt and txt != last_clip and len(txt) < 65536:
+                last_clip = txt
+                b64 = base64.b64encode(txt.encode("utf-8")).decode("ascii")
+                osc = f"\x1b]52;c;{b64}\x07".encode("ascii")
+                os.write(stdout_fd, osc)
+        except Exception:
+            pass
+        stop_event.wait(0.4)
+
 def main():
-    global force_redraw, resized
+    try:
+        os.getcwd()
+    except OSError:
+        os.chdir(os.path.expanduser("~"))
+    global force_redraw, resized, dynamic_xrandr, VIRT_W, VIRT_H, osd_text, osd_until
 
     font_mgr.save_and_ensure_normal()
     if len(sys.argv) < 2:
@@ -353,7 +461,7 @@ def main():
     procs = []
 
     xvfb = subprocess.Popen(
-        ["Xvfb", DISPLAY_NUM, "-screen", "0", f"{VIRT_W}x{VIRT_H}x24", "-ac", "+extension", "GLX"],
+        ["Xvfb", DISPLAY_NUM, "-screen", "0", f"{MAX_FB_W}x{MAX_FB_H}x24", "-dpi", "96", "-ac", "+extension", "GLX", "+extension", "RANDR"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
     procs.append(xvfb)
@@ -364,6 +472,12 @@ def main():
     app_env["WAYLAND_DISPLAY"] = ""
     app_env["DRI_PRIME"] = "1"
     app_env["MESA_LOADER_DRIVER_OVERRIDE"] = "radeonsi"
+    app_env["GDK_SCALE"] = "1"
+    app_env["GDK_DPI_SCALE"] = "1"
+    app_env["QT_SCALE_FACTOR"] = "1"
+    app_env["QT_AUTO_SCREEN_SCALE_FACTOR"] = "0"
+    app_env["ELM_SCALE"] = "1"
+    apply_xvfb_resolution(app_env, BASE_W, BASE_H)
 
     cmd_joined = " ".join(app_cmd)
     is_flatpak = "flatpak" in cmd_joined
@@ -387,10 +501,11 @@ def main():
             if "--no-remote" not in app_cmd:
                 app_cmd = app_cmd + ["--no-remote", "--profile", "/tmp/tplay-firefox-profile"]
         else:
-            os.makedirs("/tmp/tplay-chromium-profile", exist_ok=True)
+            temp_browser_profile = tempfile.mkdtemp(prefix="tplay-chromium-")
             extra_flags = [
-                "--user-data-dir=/tmp/tplay-chromium-profile",
+                f"--user-data-dir={temp_browser_profile}",
                 "--ozone-platform=x11",
+                "--force-device-scale-factor=1",
                 "--no-first-run",
                 "--disable-dev-shm-usage",
                 f"--window-size={VIRT_W},{VIRT_H}",
@@ -405,7 +520,14 @@ def main():
     else:
         launch_cmd = ["vglrun", "-d", "egl"] + app_cmd
 
-    app_proc = subprocess.Popen(launch_cmd, env=app_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    log_path = os.path.expanduser("~/tplay-debug.log")
+    log_f = open(log_path, "w", encoding="utf-8")
+    log_f.write(f"=== TPlay Turbo Debug Log ===\n")
+    log_f.write(f"app_cmd: {app_cmd}\n")
+    log_f.write(f"launch_cmd: {launch_cmd}\n")
+    log_f.write(f"DISPLAY={app_env.get('DISPLAY')} WAYLAND_DISPLAY={app_env.get('WAYLAND_DISPLAY')}\n\n")
+    log_f.flush()
+    app_proc = subprocess.Popen(launch_cmd, env=app_env, stdout=log_f, stderr=log_f)
     procs.append(app_proc)
 
     xdo = subprocess.Popen(["xdotool", "-"], stdin=subprocess.PIPE, env=app_env.copy(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -434,6 +556,9 @@ def main():
     frame_counter = 0
     last_fit_time = 0.0
 
+    clip_stop = threading.Event()
+    threading.Thread(target=osc52_clipboard_worker, args=(app_env, stdout_fd, clip_stop), daemon=True).start()
+
     try:
         tty.setraw(stdin_fd)
         os.write(stdout_fd, b"\x1b[?1049h\x1b[?25l\x1b[?1003h\x1b[?1006h\x1b[2J\x1b[H")
@@ -447,6 +572,11 @@ def main():
                 if (new_cols, new_rows) != (cols, rows):
                     stop_ffmpeg(ffmpeg)
                     cols, rows = new_cols, new_rows
+                    if dynamic_xrandr:
+                        dyn_w, dyn_h = compute_dynamic_resolution(cols, rows)
+                        apply_xvfb_resolution(app_env, dyn_w, dyn_h)
+                        osd_text = f" [ Mode: Dynamic XRANDR ({VIRT_W}x{VIRT_H}) | F12: Switch ] "
+                        osd_until = time.time() + 1.5
                     fps = choose_target_fps(cols, rows)
                     frame_bytes = cols * (rows * 2) * 3
                     out_buf = (ctypes.c_uint8 * (cols * rows * 48 + 4096))()
@@ -461,6 +591,22 @@ def main():
                 data = os.read(stdin_fd, 4096)
                 if not data or b'\x1c' in data:
                     break
+                if b'\x1b[24~' in data or b'\x19' in data:
+                    data = data.replace(b'\x1b[24~', b'').replace(b'\x19', b'')
+                    dynamic_xrandr = not dynamic_xrandr
+                    stop_ffmpeg(ffmpeg)
+                    if dynamic_xrandr:
+                        dyn_w, dyn_h = compute_dynamic_resolution(cols, rows)
+                        apply_xvfb_resolution(app_env, dyn_w, dyn_h)
+                        osd_text = f" [ Mode: Dynamic XRANDR ({VIRT_W}x{VIRT_H}) | F12: Switch ] "
+                    else:
+                        apply_xvfb_resolution(app_env, BASE_W, BASE_H)
+                        osd_text = f" [ Mode: Stretch ({VIRT_W}x{VIRT_H}) | F12: Switch ] "
+                    osd_until = time.time() + 2.0
+                    ffmpeg = start_ffmpeg(cols, rows, fps)
+                    os.write(stdout_fd, b"\x1b[2J\x1b[H")
+                    force_redraw = True
+
                 if b'\x0c' in data:
                     maximize_xvfb_windows(app_env)
                     os.write(stdout_fd, b"\x1b[2J\x1b[H")
@@ -537,8 +683,25 @@ def main():
                 written = lib.render_diff_frame(c_frame, cols, rows, is_full, out_buf)
                 if written > 0:
                     os.write(stdout_fd, memoryview(out_buf)[:written])
+                if osd_text and time.time() < osd_until:
+                    banner = f"\x1b[1;1H\x1b[48;2;20;20;20m\x1b[38;2;0;255;140m{osd_text[:cols]}\x1b[0m".encode()
+                    os.write(stdout_fd, banner)
+                elif osd_text:
+                    osd_text = ""
+                    force_redraw = True
 
     finally:
+        try:
+            if "temp_browser_profile" in locals():
+                shutil.rmtree(temp_browser_profile, ignore_errors=True)
+        except Exception:
+            pass
+        try:
+            log_f.write(f"\napp_proc exit code: {app_proc.poll()}\n")
+            log_f.close()
+        except Exception:
+            pass
+        clip_stop.set()
         termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_tty)
         font_mgr.restore_and_reset(stdout_fd)
         stop_ffmpeg(ffmpeg)
