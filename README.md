@@ -6,16 +6,26 @@ TPlay Turbo renders full X11, OpenGL, Vulkan applications, web browsers, RDP ses
 
 ---
 
+## Quick One-Line Install (Build from Source)
+
+Install dependencies, compile the C renderer, and install `tplay-turbo` automatically on **Fedora, Ubuntu/Debian/WSL2, or Arch Linux**:
+
+```bash
+curl -fsSL https://githubusercontent.com | bash
+```
+
+---
+
 ## Key Features
 
 * **Unified TUI Launcher:** Automatically discovers native `.desktop` apps, **Flatpak**, **Snap**, and **AppImage** binaries with instant fuzzy search.
 * **Frameless Web Apps (`URL` mode):** Launches websites in isolated Chromium/Brave/Firefox app windows with clean per-session profiles.
-* **Built-in RDP Client (`v2.2.0`):** Connect directly to Windows/Linux RDP servers from the TUI menu (`xfreerdp3` / `xfreerdp` / `rdesktop`) with `/dynamic-resolution` support — works great over SSH jump hosts and inside **WSL2 + Windows Terminal**.
-* **Dynamic Viewport Scaling (`F12` / `Ctrl+Y`):** Switch live between fixed **Stretch (`1280x720`)** and **Dynamic XRANDR**, which adapts the virtual `Xvfb` framebuffer resolution and mouse coordinates to match your terminal window aspect ratio in real time.
-* **SSH Clipboard Bridge (`OSC 52`):** Text copied (`Ctrl+C`) inside the virtual X11 session automatically syncs to your local PC or mobile SSH client clipboard (Kitty, Alacritty, WezTerm, Foot, Windows Terminal, Termius, Termux).
+* **Built-in RDP Client (`v2.2.0+`):** Connect directly to Windows/Linux RDP servers from the TUI menu (`xfreerdp3` / `xfreerdp` / `rdesktop`) with `/dynamic-resolution` support — works great over SSH jump hosts and inside **WSL2 + Windows Terminal**.
+* **Auto Screen Detection & Dynamic Viewport (`F12` / `Ctrl+Y`):** Automatically detects physical window/monitor proportions (`TIOCGWINSZ` / `xrandr` / `DRM`) to eliminate vertical stretching, and lets you switch live between **Dynamic XRANDR** and fixed **Stretch (`1280x720`)** mode.
+* **Instant Clipboard Bridge (`OSC 52` + Wayland):** Text copied (`Ctrl+C`) or selected inside the virtual X11 session automatically syncs to your local desktop (`wl-copy`) or mobile SSH client clipboard (`OSC 52` for Kitty, Alacritty, WezTerm, Foot, Windows Terminal, Termius, Termux).
 * **Multithreaded C Zone-Diff Renderer:** Splits the frame into `16x8` zones, rendering only dirty regions via ANSI TrueColor half-blocks (`▀`) with Synchronized Output (`\x1b[?2026h`) to eliminate tearing and minimize SSH bandwidth.
 * **Hardware VA-API Downscaling:** Uses `/dev/dri/renderD128` for GPU-accelerated frame scaling when available, falling back smoothly to fast bilinear CPU scaling.
-* **Automatic Font & HiDPI Management:** Temporarily switches supported terminals (Ptyxis, Kitty, XTerm-compatible) to a crisp `4pt` pixel font (`TPlayPixel.ttf`), enforces `1:1 (96 DPI)` scaling inside `Xvfb`, and cleanly restores your terminal upon exit.
+* **Automatic Font & `1:1 (96 DPI)` Scaling:** Temporarily switches supported terminals (Ptyxis, Kitty, XTerm-compatible) to a crisp `4pt` pixel font (`TPlayPixel.ttf`), enforces `1:1 (96 DPI)` UI scaling inside `Xvfb` so complex apps like Blender and browsers fit cleanly, and restores your terminal upon exit.
 
 ---
 
@@ -23,42 +33,40 @@ TPlay Turbo renders full X11, OpenGL, Vulkan applications, web browsers, RDP ses
 
 | Shortcut | Action |
 | :--- | :--- |
-| **`F12`** or **`Ctrl+Y`** | Toggle **Stretch (`1280x720`)** ↔ **Dynamic XRANDR** viewport mode |
+| **`F12`** or **`Ctrl+Y`** | Toggle **Dynamic XRANDR** ↔ **Stretch (`1280x720`)** viewport mode |
 | **`Ctrl+L`** | Force fit/maximize active windows and redraw screen |
 | **`Ctrl+\`** | Exit session and restore terminal settings |
 
 ---
 
-## Installation
+## Package Installation
 
 ### 1. Fedora / RHEL (`.rpm`)
-Download `tplay-turbo-2.2.0-1.fc45.x86_64.rpm` from **[Releases](https://github.com)** and install via `dnf`:
+Download `tplay-turbo-2.2.1-1.fc45.x86_64.rpm` from **[Releases](https://github.com)** and install via `dnf`:
 ```bash
-sudo dnf install -y ./tplay-turbo-2.2.0-1.*.x86_64.rpm
+sudo dnf install -y ./tplay-turbo-2.2.1-1.*.x86_64.rpm
 ```
 
 ### 2. Ubuntu / Debian / WSL2 (`.deb`)
-Download `tplay-turbo_2.2.0_amd64.deb` from **[Releases](https://github.com)** and install via `apt`:
+Download `tplay-turbo_2.2.1_amd64.deb` from **[Releases](https://github.com)** and install via `apt`:
 ```bash
 sudo apt update
-sudo apt install -y ./tplay-turbo_2.2.0_amd64.deb
+sudo apt install -y ./tplay-turbo_2.2.1_amd64.deb
 ```
 
 ### 3. Universal Linux Tarball (`.tar.gz` — Arch, Gentoo, etc.)
-Download `tplay-turbo-2.2.0-linux-x86_64.tar.gz` from **[Releases](https://github.com)**, extract, and run the installer (ensure `python3`, `ffmpeg`, `xvfb`, `xdotool`, `xrandr`, `xclip`, and `fontconfig` are installed):
+Download `tplay-turbo-2.2.1-linux-x86_64.tar.gz` from **[Releases](https://github.com)**, extract, and run the installer:
 ```bash
-tar -xzf tplay-turbo-2.2.0-linux-x86_64.tar.gz
-cd tplay-turbo-2.2.0
+tar -xzf tplay-turbo-2.2.1-linux-x86_64.tar.gz
+cd tplay-turbo-2.2.1
 ./install.sh
 ```
 
-### 4. Build from Source
+### 4. Manual Build from Source
 ```bash
 git clone https://github.com
 cd tplay
-make
-sudo make install
-sudo fc-cache -f /usr/share/fonts/tplay
+./build.sh
 ```
 
 ---
@@ -89,7 +97,13 @@ TPLAY_FPS=24 tplay-turbo
 1. **Virtual Display (`Xvfb`):** Starts an isolated headless X11 server (`96 DPI`, `GLX` + `RANDR` enabled) with `1:1` UI scaling.
 2. **Capture & Scale (`ffmpeg`):** Grabs the virtual framebuffer and scales it directly to your terminal's `cols x (rows * 2)` pixel grid via VA-API or `fast_bilinear`.
 3. **Diff Engine (`libtplay_turbo.so`):** Multithreaded C library comparing `16x8` blocks against the previous frame and emitting minimal TrueColor ANSI sequences.
-4. **Input & Clipboard Bridge:** Translates SGR mouse events (`1006`) and keyboard input via `xdotool`, while syncing X11 clipboard changes to your local terminal via `OSC 52`.
+4. **Input & Clipboard Bridge:** Translates SGR mouse events (`1006`) and keyboard input via `xdotool`, while syncing X11 clipboard changes to your local terminal via `OSC 52` and `wl-copy`.
+
+---
+
+## Disclaimer & Stability Notice
+
+> **Experimental Software Notice:** TPlay Turbo (`v2.2.1`) is an active experimental project under rapid development. While tested on Fedora, Ubuntu, and WSL2, you may encounter occasional visual artifacts, terminal font reset quirks on unsupported terminal emulators, high CPU usage at very large grid resolutions, or input edge cases in certain X11/OpenGL applications. Always save important work in external applications and press **`Ctrl+\`** to exit cleanly and restore terminal settings.
 
 ---
 
