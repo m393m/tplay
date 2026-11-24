@@ -11,7 +11,7 @@ TPlay Turbo renders full X11, OpenGL, Vulkan applications, web browsers, RDP ses
 Install dependencies, compile the C renderer, and install `tplay-turbo` automatically on **Fedora, Ubuntu/Debian/WSL2, or Arch Linux**:
 
 ```bash
-curl -fsSL https://githubusercontent.com | bash
+curl -fsSL https://raw.githubusercontent.com/m393m/tplay/main/install.sh | bash
 ```
 
 ---
