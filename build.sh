@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -e
 
-REPO_URL="https://github.com"
+REPO_URL="https://github.com/m393m/tplay.git"
 TMP_DIR=$(mktemp -d /tmp/tplay-build-XXXXXX)
 cleanup() { rm -rf "$TMP_DIR"; }
 trap cleanup EXIT
@@ -40,4 +40,4 @@ sudo fc-cache -f /usr/share/fonts/tplay >/dev/null 2>&1 || true
 
 echo ""
 echo "✅ TPlay Turbo 2.2.1 successfully built and installed!"
-echo "👉 Run it with: tplay-turbo"
+echo "👉 Run it with: tplay-turbo"   
