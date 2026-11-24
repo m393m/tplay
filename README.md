@@ -64,9 +64,10 @@ cd tplay-turbo-2.2.1
 
 ### 4. Manual Build from Source
 ```bash
-git clone https://github.com
+git clone https://github.com/m393m/tplay.git
 cd tplay
 ./build.sh
+sudo make install   
 ```
 
 ---
