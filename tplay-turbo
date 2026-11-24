@@ -31,7 +31,7 @@ DISPLAY_NUM = ":98"
 BASE_W, BASE_H = 1280, 720
 MAX_FB_W, MAX_FB_H = 3840, 2160
 VIRT_W, VIRT_H = BASE_W, BASE_H
-dynamic_xrandr = False
+dynamic_xrandr = True
 osd_text = ""
 osd_until = 0.0
 force_redraw = True
@@ -43,6 +43,42 @@ def on_sigwinch(signum, frame):
     force_redraw = True
 
 signal.signal(signal.SIGWINCH, on_sigwinch)
+
+def detect_screen_resolution(fd):
+    try:
+        packed = fcntl.ioctl(fd, termios.TIOCGWINSZ, b'\x00' * 8)
+        rows, cols, xpix, ypix = struct.unpack('HHHH', packed)
+        if xpix >= 640 and ypix >= 360:
+            return xpix - (xpix % 2), ypix - (ypix % 2)
+    except Exception:
+        pass
+
+    try:
+        host_env = os.environ.copy()
+        if shutil.which("xrandr") and host_env.get("DISPLAY"):
+            out = subprocess.check_output(["xrandr", "--current"], env=host_env, stderr=subprocess.DEVNULL, timeout=0.5).decode()
+            m = re.search(r'current\s+(\d+)\s+x\s+(\d+)', out)
+            if m:
+                w, h = int(m.group(1)), int(m.group(2))
+                if w >= 640 and h >= 360:
+                    return w - (w % 2), h - (h % 2)
+    except Exception:
+        pass
+
+    try:
+        import glob
+        for mode_file in glob.glob("/sys/class/drm/card*-*/modes"):
+            with open(mode_file, "r") as mf:
+                first_line = mf.readline().strip()
+                if "x" in first_line:
+                    parts = first_line.split("x")
+                    w, h = int(parts[0]), int(parts[1])
+                    if w >= 640 and h >= 360:
+                        return w - (w % 2), h - (h % 2)
+    except Exception:
+        pass
+
+    return 1920, 1080
 
 def get_term_size(fd):
     try:
@@ -66,20 +102,34 @@ def choose_target_fps(cols, rows):
         return 24
     return 30
 
-def compute_dynamic_resolution(cols, rows):
-    w_px = max(320, cols)
-    h_px = max(200, rows * 2)
-    aspect = w_px / float(h_px)
-    target_w = max(w_px, 1280) if aspect >= 1.0 else max(w_px, int(900 * aspect))
-    target_h = int(round(target_w / aspect))
-    if target_w > MAX_FB_W:
-        target_w = MAX_FB_W
+def compute_dynamic_resolution(cols, rows, fd=None):
+    use_fd = fd if fd is not None else sys.stdout.fileno()
+    # 1. Пытаемся взять реальные физические пропорции окна в пикселях (убирает сплющивание на любом шрифте)
+    aspect = None
+    try:
+        packed = fcntl.ioctl(use_fd, termios.TIOCGWINSZ, b'\x00' * 8)
+        _, _, xpix, ypix = struct.unpack('HHHH', packed)
+        if xpix > 100 and ypix > 100:
+            aspect = xpix / float(ypix)
+    except Exception:
+        pass
+    if aspect is None:
+        aspect = max(10, cols) / float(max(5, rows) * 2.0)
+
+    # 2. Ограничиваем виртуальный буфер разумным потолком (до 1920x1080), чтобы не было лагов на любом шрифте
+    screen_w, screen_h = detect_screen_resolution(use_fd)
+    cap_w = min(1920, max(1280, screen_w))
+    cap_h = min(1080, max(720, screen_h))
+
+    if aspect >= (cap_w / float(cap_h)):
+        target_w = cap_w
         target_h = int(round(target_w / aspect))
-    if target_h > MAX_FB_H:
-        target_h = MAX_FB_H
+    else:
+        target_h = cap_h
         target_w = int(round(target_h * aspect))
-    target_w = max(320, min(MAX_FB_W, target_w - (target_w % 2)))
-    target_h = max(200, min(MAX_FB_H, target_h - (target_h % 2)))
+
+    target_w = max(640, min(MAX_FB_W, target_w - (target_w % 2)))
+    target_h = max(360, min(MAX_FB_H, target_h - (target_h % 2)))
     return target_w, target_h
 
 def apply_xvfb_resolution(env, new_w, new_h):
@@ -173,7 +223,7 @@ class TerminalFontManager:
 
         sys.stdout.write("\x1b]50;TPlayPixel:size=4\x07")
         sys.stdout.flush()
-        time.sleep(0.25)
+        time.sleep(0.35)
 
     def restore_and_reset(self, stdout_fd):
         if shutil.which("gsettings"):
@@ -423,25 +473,41 @@ def maximize_xvfb_windows(env):
     except Exception:
         pass
 
-def osc52_clipboard_worker(env, stdout_fd, stop_event):
-    last_clip = ""
+def sync_clipboard_once(env, stdout_fd, last_clip_box):
     has_xclip = shutil.which("xclip") is not None
     has_xsel = shutil.which("xsel") is not None
     if not has_xclip and not has_xsel:
         return
-    while not stop_event.is_set():
+    txt = ""
+    for sel in ("clipboard", "primary"):
         try:
-            cmd = ["xclip", "-o", "-selection", "clipboard"] if has_xclip else ["xsel", "-ob"]
-            out = subprocess.check_output(cmd, env=env, stderr=subprocess.DEVNULL, timeout=0.5)
-            txt = out.decode("utf-8", errors="ignore")
-            if txt and txt != last_clip and len(txt) < 65536:
-                last_clip = txt
-                b64 = base64.b64encode(txt.encode("utf-8")).decode("ascii")
-                osc = f"\x1b]52;c;{b64}\x07".encode("ascii")
-                os.write(stdout_fd, osc)
+            cmd = (["xclip", "-o", "-selection", sel] if has_xclip
+                   else ["xsel", "-ob" if sel == "clipboard" else "-op"])
+            out = subprocess.check_output(cmd, env=env, stderr=subprocess.DEVNULL, timeout=0.3)
+            val = out.decode("utf-8", errors="ignore")
+            if val:
+                txt = val
+                break
         except Exception:
             pass
-        stop_event.wait(0.4)
+    try:
+        if txt and txt != last_clip_box and len(txt) < 65536:
+            last_clip_box = txt
+            b64 = base64.b64encode(txt.encode("utf-8")).decode("ascii")
+            osc = f"\x1b]52;c;{b64}\x07".encode("ascii")
+            os.write(stdout_fd, osc)
+            if shutil.which("wl-copy"):
+                host_env = os.environ.copy()
+                if host_env.get("WAYLAND_DISPLAY"):
+                    subprocess.run(["wl-copy"], input=txt.encode("utf-8"), env=host_env,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=0.3)
+    except Exception:
+        pass
+
+def osc52_clipboard_worker(env, stdout_fd, stop_event, last_clip_box):
+    while not stop_event.is_set():
+        sync_clipboard_once(env, stdout_fd, last_clip_box)
+        stop_event.wait(0.15)
 
 def main():
     try:
@@ -477,7 +543,9 @@ def main():
     app_env["QT_SCALE_FACTOR"] = "1"
     app_env["QT_AUTO_SCREEN_SCALE_FACTOR"] = "0"
     app_env["ELM_SCALE"] = "1"
-    apply_xvfb_resolution(app_env, BASE_W, BASE_H)
+    init_cols, init_rows = get_term_size(sys.stdout.fileno())
+    auto_w, auto_h = compute_dynamic_resolution(init_cols, init_rows, sys.stdout.fileno())
+    apply_xvfb_resolution(app_env, auto_w, auto_h)
 
     cmd_joined = " ".join(app_cmd)
     is_flatpak = "flatpak" in cmd_joined
@@ -557,7 +625,8 @@ def main():
     last_fit_time = 0.0
 
     clip_stop = threading.Event()
-    threading.Thread(target=osc52_clipboard_worker, args=(app_env, stdout_fd, clip_stop), daemon=True).start()
+    last_clip_box = ['']
+    threading.Thread(target=osc52_clipboard_worker, args=(app_env, stdout_fd, clip_stop, last_clip_box), daemon=True).start()
 
     try:
         tty.setraw(stdin_fd)
@@ -639,13 +708,21 @@ def main():
                     xdo.stdin.flush()
 
                 key_data = sgr_re.sub(b'', data)
+                # Убираем обрывки SGR-мыши (например, '<0;120;45m' или '120;45M') и неизвестные CSI-последовательности
+                key_data = re.sub(rb'\x1b\[[0-9;?]*[a-zA-Z~]', b'', key_data)
+                key_data = re.sub(rb'(?:\x1b\[)?<?\d+;\d+;\d+[Mm]', b'', key_data)
                 if key_data:
                     if key_data in special_keys:
                         xdo.stdin.write(f"key --clearmodifiers {special_keys[key_data]}\n".encode())
                         xdo.stdin.flush()
                     elif len(key_data) == 1 and 1 <= next(iter(key_data)) <= 26:
                         ch = chr(next(iter(key_data)) + 96)
-                        xdo.stdin.write(f"key --clearmodifiers ctrl+{ch}\n".encode())
+                        if ch == 'c':
+                            xdo.stdin.write(b"keydown Control_L\nkey c\nkeyup Control_L\nkey ctrl+Insert\n")
+                        elif ch == 'v':
+                            xdo.stdin.write(b"keydown Control_L\nkey v\nkeyup Control_L\n")
+                        else:
+                            xdo.stdin.write(f"keydown Control_L\nkey {ch}\nkeyup Control_L\n".encode())
                         xdo.stdin.flush()
                     elif len(key_data) == 2 and key_data[0] == 27 and chr(key_data[1]).isalnum():
                         ch = chr(key_data[1]).lower()

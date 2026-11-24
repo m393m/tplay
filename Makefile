@@ -1,22 +1,24 @@
-CC ?= gcc
-CFLAGS ?= -O3 -fPIC -pthread
-PREFIX ?= /usr
-LIBDIR ?= $(PREFIX)/lib64
-BINDIR ?= $(PREFIX)/bin
-FONTDIR ?= $(PREFIX)/share/fonts/tplay
+CC = gcc
+CFLAGS = -O3 -march=native -fPIC -shared -pthread -Wall -Wextra
+PREFIX = /usr
+LIBDIR = $(PREFIX)/lib64
+ifeq ($(wildcard $(LIBDIR)),)
+	LIBDIR = $(PREFIX)/lib
+endif
 
 all: libtplay_turbo.so
 
 libtplay_turbo.so: libtplay_turbo.c
-	$(CC) $(CFLAGS) -shared libtplay_turbo.c -o libtplay_turbo.so
+	$(CC) $(CFLAGS) -o $@ $<
 
 install: all
-	install -d $(DESTDIR)$(BINDIR)
-	install -d $(DESTDIR)$(LIBDIR)
-	install -d $(DESTDIR)$(FONTDIR)
-	install -m 0755 tplay-turbo $(DESTDIR)$(BINDIR)/tplay-turbo
+	install -d $(DESTDIR)$(PREFIX)/bin $(DESTDIR)$(LIBDIR) $(DESTDIR)$(PREFIX)/share/fonts/tplay
+	install -m 0755 tplay-turbo $(DESTDIR)$(PREFIX)/bin/tplay-turbo
+	sed -i "s|/usr/lib64/libtplay_turbo.so|$(LIBDIR)/libtplay_turbo.so|g" $(DESTDIR)$(PREFIX)/bin/tplay-turbo
 	install -m 0755 libtplay_turbo.so $(DESTDIR)$(LIBDIR)/libtplay_turbo.so
-	if [ -f TPlayPixel.ttf ]; then install -m 0644 TPlayPixel.ttf $(DESTDIR)$(FONTDIR)/TPlayPixel.ttf; fi
+	install -m 0644 TPlayPixel.ttf $(DESTDIR)$(PREFIX)/share/fonts/tplay/TPlayPixel.ttf
 
 clean:
 	rm -f libtplay_turbo.so
+
+.PHONY: all install clean
