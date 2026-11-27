@@ -1,113 +1,109 @@
-# TPlay Turbo
+# tplay — запуск графических приложений и игр в Linux без рабочего стола (DE)
 
-**Ultra-lightweight headless terminal graphics compositor, RDP client & TUI launcher for Linux and WSL2.**
+**`tplay`** — лёгкий инструмент на языке **C** для запуска графических программ, браузеров, 3D-редакторов и игр в Linux **без запуска тяжёлых окружений рабочего стола (GNOME, KDE, XFCE) и без полноценного Xorg**.
 
-TPlay Turbo renders full X11, OpenGL, Vulkan applications, web browsers, RDP sessions, and 3D games directly inside a raw Linux TTY or terminal emulator — with zero desktop environment (KDE/GNOME/Wayland) required on the host or client.
+Проект развивается в виде **двух независимых редакций** под разные сценарии использования:
 
----
-
-## Quick One-Line Install (Build from Source)
-
-Install dependencies, compile the C renderer, and install `tplay-turbo` automatically on **Fedora, Ubuntu/Debian/WSL2, or Arch Linux**:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/m393m/tplay/main/install.sh | bash
-```
+1. **`v4.0.0` — Native Edition (Гибридный C11 Wayland/DRM + XWayland композитор)**  
+   Для локального запуска в чистом текстовом терминале (`TTY`, например `Ctrl + Alt + F4`) с полным аппаратным ускорением видеокарты (`AMD`, `Intel`, `NVIDIA`), звуком и 360°-управлением в 3D-играх.
+2. **`v2.2.1` — Terminal / SSH Edition (`TPlay Turbo`)**  
+   Для удалённой работы по **SSH**, на серверах без монитора и внутри обычных окон терминала через высокоскоростной рендер символами Unicode (`▀`) в 24-битном цвете.
 
 ---
 
-## Key Features
+## Сравнение редакций
 
-* **Unified TUI Launcher:** Automatically discovers native `.desktop` apps, **Flatpak**, **Snap**, and **AppImage** binaries with instant fuzzy search.
-* **Frameless Web Apps (`URL` mode):** Launches websites in isolated Chromium/Brave/Firefox app windows with clean per-session profiles.
-* **Built-in RDP Client (`v2.2.0+`):** Connect directly to Windows/Linux RDP servers from the TUI menu (`xfreerdp3` / `xfreerdp` / `rdesktop`) with `/dynamic-resolution` support — works great over SSH jump hosts and inside **WSL2 + Windows Terminal**.
-* **Auto Screen Detection & Dynamic Viewport (`F12` / `Ctrl+Y`):** Automatically detects physical window/monitor proportions (`TIOCGWINSZ` / `xrandr` / `DRM`) to eliminate vertical stretching, and lets you switch live between **Dynamic XRANDR** and fixed **Stretch (`1280x720`)** mode.
-* **Instant Clipboard Bridge (`OSC 52` + Wayland):** Text copied (`Ctrl+C`) or selected inside the virtual X11 session automatically syncs to your local desktop (`wl-copy`) or mobile SSH client clipboard (`OSC 52` for Kitty, Alacritty, WezTerm, Foot, Windows Terminal, Termius, Termux).
-* **Multithreaded C Zone-Diff Renderer:** Splits the frame into `16x8` zones, rendering only dirty regions via ANSI TrueColor half-blocks (`▀`) with Synchronized Output (`\x1b[?2026h`) to eliminate tearing and minimize SSH bandwidth.
-* **Hardware VA-API Downscaling:** Uses `/dev/dri/renderD128` for GPU-accelerated frame scaling when available, falling back smoothly to fast bilinear CPU scaling.
-* **Automatic Font & `1:1 (96 DPI)` Scaling:** Temporarily switches supported terminals (Ptyxis, Kitty, XTerm-compatible) to a crisp `4pt` pixel font (`TPlayPixel.ttf`), enforces `1:1 (96 DPI)` UI scaling inside `Xvfb` so complex apps like Blender and browsers fit cleanly, and restores your terminal upon exit.
-
----
-
-## Hotkeys (Inside Session)
-
-| Shortcut | Action |
-| :--- | :--- |
-| **`F12`** or **`Ctrl+Y`** | Toggle **Dynamic XRANDR** ↔ **Stretch (`1280x720`)** viewport mode |
-| **`Ctrl+L`** | Force fit/maximize active windows and redraw screen |
-| **`Ctrl+\`** | Exit session and restore terminal settings |
+| Параметр | `v4.0.0` Native Edition | `v2.2.1` Terminal / SSH Edition |
+| :--- | :--- | :--- |
+| **Среда запуска** | Локальный Linux TTY (`Ctrl+Alt+F4`) | SSH-сессия, headless-сервер, окно терминала |
+| **Графический стек** | Чистый C11 + `wlroots-0.20` + `DRM/KMS` + `XWayland` | `Xvfb` + `FFmpeg` + C-рендерер ANSI (`▀`) |
+| **Ускорение GPU** | Аппаратное (`DMA-BUF` / `Vulkan` / `GLES2`) | Программный захват кадра в символы |
+| **Частота кадров** | Родная частота монитора (`60+ FPS`) | Адаптивный FPS под ширину канала SSH |
+| **Звук и геймпады** | Да (`PipeWire` / `PulseAudio` + `uinput`) | Нет (только видео и ввод с клавиатуры/мыши) |
+| **Совместимость ПО** | Wayland, X11, Flatpak, Snap, Wine, 3D-игры | Любые X11 / OpenGL приложения в терминале |
 
 ---
 
-## Package Installation
+## 1. `v4.0.0` — Native Edition (Локальный TTY, максимум производительности)
 
-### 1. Fedora / RHEL (`.rpm`)
-Download `tplay-turbo-2.2.1-1.fc45.x86_64.rpm` from **[Releases](https://github.com)** and install via `dnf`:
+Нативный однофайловый композитор на C11, который поднимает изолированную графическую сессию поверх ядра Linux (`DRM/KMS`) и автоматически разворачивает запущенное приложение на весь экран.
+
+### Ключевые возможности
+- **Нулевые потери производительности:** прямой рендер через `GBM` и `DRM/KMS` на видеокартах **AMD Radeon**, **Intel** и **NVIDIA**.
+- **Гибридная совместимость (Wayland + X11):** современные программы запускаются нативно по протоколу Wayland, а старые X11-приложения, Wine и игры на Godot 3 автоматически подхватываются встроенным мостом `XWayland`.
+- **Поддержка Flatpak и Snap:** автоматический проброс переменных `WAYLAND_DISPLAY`, `DISPLAY`, `XDG_RUNTIME_DIR` и `DBUS_SESSION_BUS_ADDRESS`.
+- **360°-камера и свободный курсор:** поддержка `relative-pointer-v1` и `pointer-constraints-v1` для шутеров и песочниц от первого лица с автоматической разблокировкой курсора в меню паузы.
+- **Звук и контроллеры:** работа звука через `PipeWire` / `PulseAudio` и поддержка геймпадов (включая виртуальные через `uinput`).
+
+### Быстрый запуск (`v4.0.0`)
+
+1. Переключитесь в свободный текстовый терминал: **`Ctrl + Alt + F4`** и выполните вход.
+2. Запустите любую программу одной командой:
+
 ```bash
-sudo dnf install -y ./tplay-turbo-2.2.1-1.*.x86_64.rpm
+# Браузеры и 3D-редакторы
+tplay firefox
+tplay blender
+
+# Flatpak-приложения и игры
+tplay flatpak run org.vinegarhq.Sober
+
+# Snap-приложения
+tplay snap run <имя_пакета>
 ```
 
-### 2. Ubuntu / Debian / WSL2 (`.deb`)
-Download `tplay-turbo_2.2.1_amd64.deb` from **[Releases](https://github.com)** and install via `apt`:
+**Управление и выход:**
+- Переключение раскладки клавиатуры (`US / RU`): **`Alt + Shift`**
+- Выход и мгновенный возврат в консоль: закрытие окна программы, **`Ctrl + Delete`**, **`Ctrl + BackSpace`** или **`F12`**.
+
+> **Примечание для звука и геймпадов в TTY:** убедитесь, что ваш пользователь добавлен в системные группы `audio` и `input`:
+> ```bash
+> sudo usermod -aG audio,input \$USER
+> ```
+
+### Сборка из исходников (`v4.0.0`)
+
+#### Зависимости (Fedora)
 ```bash
-sudo apt update
-sudo apt install -y ./tplay-turbo_2.2.1_amd64.deb
+sudo dnf install -y gcc make wlroots-devel wayland-devel wayland-protocols-devel libxkbcommon-devel xorg-x11-server-Xwayland
 ```
 
-### 3. Universal Linux Tarball (`.tar.gz` — Arch, Gentoo, etc.)
-Download `tplay-turbo-2.2.1-linux-x86_64.tar.gz` from **[Releases](https://github.com)**, extract, and run the installer:
+#### Компиляция и установка
 ```bash
-tar -xzf tplay-turbo-2.2.1-linux-x86_64.tar.gz
-cd tplay-turbo-2.2.1
-./install.sh
-```
-
-### 4. Manual Build from Source
-```bash
-git clone https://github.com/m393m/tplay.git
-cd tplay
-./build.sh
-sudo make install   
+make
+sudo make install
 ```
 
 ---
 
-## Usage
+## 2. `v2.2.1` — Terminal / SSH Edition (`TPlay Turbo`)
 
-Launch the interactive TUI menu:
-```bash
-tplay-turbo
-```
+Консольная редакция, превращающая любой терминал с поддержкой TrueColor в экран для графических приложений. Не требует прямого доступа к видеокарте (`/dev/dri/card*`), благодаря чему работает поверх **SSH** и внутри виртуальных машин.
 
-Or launch any command directly:
+### Ключевые возможности
+- Отрисовка графики в терминале с помощью полублоков Unicode (`▀`) и 24-битных ANSI-цветов.
+- Дельта-сжатие кадров: обновляются только изменившиеся ячейки экрана для экономии трафика по SSH.
+- Проброс клавиатуры и кликов мыши из терминала в виртуальный экран `Xvfb`.
+
+### Запуск (`v2.2.1`)
+
 ```bash
+# Запуск приложения внутри терминала или по SSH
 tplay-turbo firefox
-tplay-turbo blender
-tplay-turbo xfreerdp /v:192.168.1.50 /u:Administrator
+tplay-turbo xterm
 ```
+- Выход из терминального режима: **`Ctrl + \`**
 
-Limit target frame rate via environment variable (optional):
+---
+
+## Установка готовых пакетов
+
+Готовые установочные пакеты для **Fedora (`.rpm`)**, **Debian / Ubuntu (`.deb`)** и архивы с исходным кодом (`.tar.gz`) для обеих версий доступны в разделе **[Releases](../../releases)**.
+
 ```bash
-TPLAY_FPS=24 tplay-turbo
+# Установка .deb (Ubuntu / Debian)
+sudo apt install ./tplay_4.0.0_amd64.deb
+
+# Установка .rpm (Fedora)
+sudo dnf install ./tplay-4.0.0-1.fc45.x86_64.rpm
 ```
-
----
-
-## Architecture
-
-1. **Virtual Display (`Xvfb`):** Starts an isolated headless X11 server (`96 DPI`, `GLX` + `RANDR` enabled) with `1:1` UI scaling.
-2. **Capture & Scale (`ffmpeg`):** Grabs the virtual framebuffer and scales it directly to your terminal's `cols x (rows * 2)` pixel grid via VA-API or `fast_bilinear`.
-3. **Diff Engine (`libtplay_turbo.so`):** Multithreaded C library comparing `16x8` blocks against the previous frame and emitting minimal TrueColor ANSI sequences.
-4. **Input & Clipboard Bridge:** Translates SGR mouse events (`1006`) and keyboard input via `xdotool`, while syncing X11 clipboard changes to your local terminal via `OSC 52` and `wl-copy`.
-
----
-
-## Disclaimer & Stability Notice
-
-> **Experimental Software Notice:** TPlay Turbo (`v2.2.1`) is an active experimental project under rapid development. While tested on Fedora, Ubuntu, and WSL2, you may encounter occasional visual artifacts, terminal font reset quirks on unsupported terminal emulators, high CPU usage at very large grid resolutions, or input edge cases in certain X11/OpenGL applications. Always save important work in external applications and press **`Ctrl+\`** to exit cleanly and restore terminal settings.
-
----
-
-## License
-
-MIT License
