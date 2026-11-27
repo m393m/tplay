@@ -1,3 +1,5 @@
+<img width="1206" height="781" alt="Снимок экрана от 2026-11-27 11-05-37" src="https://github.com/user-attachments/assets/74a609d0-ace5-428e-972e-23296dfb1361" />
+<img width="1206" height="781" alt="Снимок экрана от 2026-11-27 11-05-19" src="https://github.com/user-attachments/assets/6e53089b-0f97-45bf-8a54-1c83b10eddc8" />
 # tplay — запуск графических приложений и игр в Linux без рабочего стола (DE)
 
 **`tplay`** — лёгкий инструмент на языке **C** для запуска графических программ, браузеров, 3D-редакторов и игр в Linux **без запуска тяжёлых окружений рабочего стола (GNOME, KDE, XFCE) и без полноценного Xorg**.
